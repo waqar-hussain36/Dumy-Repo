@@ -1,9 +1,9 @@
 export enum PROTOCOL_ENUM {
     LIFI = 'lifi',
-    SOCKET = 'scocket',
+    SOCKET = 'socket',
     ODOS = 'odos',
     SQUID = 'squid',
     LUMIA = 'lumia',
-    ONEINCH = 'one inch',
+    ONEINCH = 'oneInch',
     PROPELLER = 'propeller'
 }

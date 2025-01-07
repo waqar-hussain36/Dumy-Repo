@@ -56,8 +56,9 @@ export class SimulateService {
                     if (quotes?.data?.routes?.length) {
                         let quote = undefined
                         if (args.protocol) {
-                            quote = quotes.data.routes.find(quote => quote.protocol === args.protocol)
-
+                            quote = quotes.data.routes.find(quote =>
+                                quote.protocol.toUpperCase() === args.protocol.toUpperCase()
+                            )
                         } else {
                             quote = quotes.data.routes[0]
                         }
