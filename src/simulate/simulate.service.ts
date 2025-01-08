@@ -1,4 +1,4 @@
-import { Injectable, InternalServerErrorException, Logger } from '@nestjs/common'
+import { Injectable, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common'
 import axios from 'axios'
 import { SimulationTxsDTO } from './dtos/simulation.dto'
 import { SWAP_TYPE_ENUM } from 'utills/enums/swap_enum'
@@ -16,37 +16,60 @@ export class SimulateService {
 
     async simulateTxs(args: SimulationTxsDTO) {
         try {
-            this.logger.log(`request received to simulate ${args.swapType} transactions`)
-            const simulatedResultToSave = {}
+            this.logger.log(`request received to simulate the swap transactions`)
             const supportedChains = (await axios.get(`${process.env.PONDER_BASE_URL}/bridge/swap/chains`))?.data?.data
+            let fromChainId = undefined
+            let toChainId = undefined
+            if (args.fromChainId || args.toChainId) {
+                const supportedChainsMap: Map<number, any> = new Map(supportedChains.map(chain => [+chain.id, chain]))
+                if (args.fromChainId) {
+                    fromChainId = supportedChainsMap.get(args.fromChainId)?.id
+                    if (!fromChainId)
+                        throw new NotFoundException(`Invalid chain id ${args.fromChainId}`)
+                }
+                if (args.toChainId) {
+                    toChainId = supportedChainsMap.get(args.toChainId)?.id
+                    if (!toChainId)
+                        throw new NotFoundException(`Invalid chain id ${args.toChainId}`)
+                }
+            }
+
             let fromTokens = undefined
+            let toTokens = undefined
             const routPromises = []
             const promisesToSimulate = []
+            const txsToSimulate = []
             for (let index = 0; index < supportedChains.length; index++) {
-                const fromChainId = supportedChains[index].id
-                let toChainId = fromChainId
-                if (!fromTokens || args.swapType === SWAP_TYPE_ENUM.ON_CHAIN)
-                    fromTokens = (await axios.get(`${process.env.PONDER_BASE_URL}/bridge/swap/tokens?chainId=${fromChainId}${args.walletAddr ? `&address=${args.walletAddr}` : ''}`))?.data?.data?.slice(0, 10)
+                fromChainId = args.fromChainId?.toString() || supportedChains[index].id
+                toChainId = args.toChainId?.toString() || args.swapType === SWAP_TYPE_ENUM.ON_CHAIN ? fromChainId : supportedChains[(index + 1) % supportedChains.length].id
+                if (fromChainId === toChainId && args.swapType === SWAP_TYPE_ENUM.CROSS_CHAIN) continue
+                if (fromChainId !== toChainId && args.swapType === SWAP_TYPE_ENUM.ON_CHAIN) continue
+                if (!fromTokens || !args.fromChainId)
+                    fromTokens = (await axios.get(`${process.env.PONDER_BASE_URL}/bridge/swap/tokens?chainId=${fromChainId}${args.walletAddr ? `&address=${args.walletAddr}` : ''}`))?.data?.data
                 if (!fromTokens?.length) continue
-                // for same chain swapping
-                let toTokens = undefined
-
+                if (!args.fromTokens?.length) {
+                    fromTokens = fromTokens.slice(0, 10)
+                }
                 // for cross chain swapping
-                if (args.swapType === SWAP_TYPE_ENUM.CROSS_CHAIN) {
-                    toChainId = supportedChains[(index + 1) % supportedChains.length].id
+                if ((args.swapType === SWAP_TYPE_ENUM.CROSS_CHAIN && !toTokens?.length) || (args.fromChainId && !args.toChainId)) {
                     toTokens = (await axios.get(`${process.env.PONDER_BASE_URL}/bridge/swap/tokens?chainId=${toChainId}`))?.data?.data?.slice(0, 10)
                     if (!toTokens?.length) continue
                 }
+                if (!args.toTokens?.length && toTokens?.length) {
+                    toTokens = toTokens.slice(0, 10)
+                }
                 this.logger.log(`${args.swapType} swapping is started from chain ${fromChainId} to chain ${toChainId}`)
-                // const promisesToSimulate = []
                 const promises = fromTokens.map(async (fromToken, index) => {
+                    const toTokenAddress = fromChainId === toChainId ? fromTokens[(index + 1) % fromTokens.length].address : toTokens[index % toTokens.length].address
+                    if (args.fromTokens?.length && !args.fromTokens.includes(fromToken.address)) return
+                    if (args.toTokens?.length && !args.toTokens.includes(toTokenAddress)) return
                     const payload = {
                         fromChain: fromChainId,
                         toChain: toChainId,
                         fromToken: [fromToken.address],
-                        toToken: fromChainId === toChainId ? [fromTokens[(index + 1) % fromTokens.length].address] : [toTokens[index % toTokens.length].address],
+                        toToken: [toTokenAddress],
                         fromAmount: [fromToken.balance]?.length > 2 ?
-                            [fromToken.balance] : // 50% of the total amount
+                            [fromToken.balance] :
                             [new BigNumber(10).multipliedBy(new BigNumber(10).pow(fromToken.decimals)).toString(10)], //default $10,
                         fromAddress: args.walletAddr || '0xcd567c7F896cD2D80D51A496f3aAC9a817ED13A9',
                     }
@@ -67,34 +90,40 @@ export class SimulateService {
                             payload['provider'] = quote.protocol
                             const route = (await axios.post(`${process.env.PONDER_BASE_URL}/bridge/swap/route`, payload)).data
                             if (route?.data?.length) {
-                                const routPromises = route.data.map(async data => {
+                                route.data.map(data => {
                                     if (data?.approvalTx?.length) {
-                                        simulatedResultToSave[quote.routeId + 'approvalTx'] = await this.txSimulation(data.approvalTx[0])
+                                        txsToSimulate.push(this.formateTxSimulatationPayload(data.approvalTx[0]))
                                     }
                                     if (data.executionTx) {
-                                        simulatedResultToSave[quote.routeId + 'executionTx'] = await this.txSimulation(data.executionTx)
+                                        txsToSimulate.push(this.formateTxSimulatationPayload(data.executionTx))
                                     }
                                 })
-                                promisesToSimulate.push(...routPromises)
                             }
                         }
                     }
                 })
+                this.logger.log(`Waiting for promises to resolve for routes from chain ${fromChainId} to chain ${toChainId}`)
+                await Promise.allSettled(promises)
                 routPromises.push(...promises)
-
-                if (args.swapType === SWAP_TYPE_ENUM.CROSS_CHAIN) {
+                if (args.swapType === SWAP_TYPE_ENUM.CROSS_CHAIN && !args.fromChainId) {
                     fromTokens = toTokens
                 }
+                if (args.fromChainId && args.toChainId) break
+                if ((args.fromChainId || args.toChainId) && args.swapType === SWAP_TYPE_ENUM.ON_CHAIN) break
             }
-            this.logger.log(`Wait for all route-related promises to settle`)
+            this.logger.log(`Wait for all route-related promises to resolve`)
             await Promise.allSettled(routPromises)
-            this.logger.log(`Wait for all simulation-related promises to settle`)
-            await Promise.allSettled(promisesToSimulate)
-            this.saveJsonAsCsv(simulatedResultToSave, 'simulated_txs.csv')
+            let simulatedResultToSave = []
+            if (txsToSimulate.length) {
+                this.logger.log(`Wait for all simulation-related promises to resolve`)
+                simulatedResultToSave = await this.simulatteInBulk(txsToSimulate)
+                if (simulatedResultToSave?.length)
+                    this.saveJsonAsCsv(simulatedResultToSave, 'simulated_txs.csv')
+            }
             return { message: 'Success', simulatedResultToSave, status: 200 }
 
         } catch (error) {
-            throw new InternalServerErrorException(error)
+            throw new InternalServerErrorException(error?.response || error)
         }
     }
 
@@ -121,19 +150,56 @@ export class SimulateService {
         }
     }
 
+    private formateTxSimulatationPayload(txDetail: any) {
+        try {
+            return {
+                network_id: txDetail.chainId,
+                from: txDetail.from,
+                to: txDetail.to,
+                input: txDetail.data,
+                simulation_type: "quick"
+            }
+        } catch (error) {
+            this.logger.log(`Error occured to formate the simulation tx payload`)
+        }
+    }
+
     saveJsonAsCsv(jsonData: any, filePath: string) {
         try {
-            const directory = path.dirname(filePath);
+            const directory = path.dirname(filePath)
             // Check if directory exists, if not, create it
             if (!fs.existsSync(directory)) {
-                fs.mkdirSync(directory, { recursive: true });
+                fs.mkdirSync(directory, { recursive: true })
             }
-            const csv = parse(jsonData);
-            fs.writeFileSync(filePath, csv);
-            console.log('CSV file saved successfully.');
+            const csv = parse(jsonData)
+            fs.writeFileSync(filePath, csv)
+            console.log('CSV file saved successfully.')
         } catch (error) {
-            console.error('Error converting to CSV:', error);
-            throw new Error('Failed to save CSV file.');
+            console.error('Error converting to CSV:', error)
+            throw new Error('Failed to save CSV file.')
+        }
+    }
+
+    private async simulatteInBulk(batchSimulationTxs: any[]) {
+        try {
+            return (
+                await axios.post(
+                    process.env.TENDERLY_BUNDLE_SIMULATE_TX_URL,
+                    // the transaction
+                    {
+                        simulations: batchSimulationTxs
+                    },
+                    {
+                        headers: {
+                            'X-Access-Key': process.env.TENDERLY_ACCESS_KEY,
+                        },
+                    },
+                )
+            )?.data
+
+        } catch (error) {
+            console.error('Error to simulate txs:', error);
+            throw new Error('Failed to simulate the txs');
         }
     }
 }
