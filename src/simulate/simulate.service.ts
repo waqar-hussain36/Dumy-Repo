@@ -37,7 +37,6 @@ export class SimulateService {
             let fromTokens = undefined
             let toTokens = undefined
             const routPromises = []
-            const promisesToSimulate = []
             const txsToSimulate = []
             for (let index = 0; index < supportedChains.length; index++) {
                 fromChainId = args.fromChainId?.toString() || supportedChains[index].id
@@ -116,7 +115,7 @@ export class SimulateService {
             let simulatedResultToSave = []
             if (txsToSimulate.length) {
                 this.logger.log(`Wait for all simulation-related promises to resolve`)
-                simulatedResultToSave = await this.simulatteInBulk(txsToSimulate)
+                simulatedResultToSave = await this.simulateInBulk(txsToSimulate)
                 if (simulatedResultToSave?.length)
                     this.saveJsonAsCsv(simulatedResultToSave, 'simulated_txs.csv')
             }
@@ -180,7 +179,7 @@ export class SimulateService {
         }
     }
 
-    private async simulatteInBulk(batchSimulationTxs: any[]) {
+    private async simulateInBulk(batchSimulationTxs: any[]) {
         try {
             return (
                 await axios.post(
